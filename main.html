@@ -144,6 +144,23 @@
   .event-block:hover { background: var(--accent-light); }
   .event-block.weekend-block { background: var(--weekend-light); border-left-color: var(--weekend); }
   .event-block.weekend-block:hover { background: #e4d9f5; }
+  .event-title { font-weight: 500; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .event-desc {
+    font-size: 10px; color: var(--text-secondary); margin-top: 3px;
+    overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3;
+    -webkit-box-orient: vertical; line-height: 1.35; white-space: pre-wrap; opacity: 0.9;
+  }
+  .popup-row.top { align-items: flex-start; }
+  .popup-row.top label { padding-top: 7px; }
+  .popup-row textarea {
+    flex: 1; min-width: 0; width: 0;
+    border: 1px solid var(--border); border-radius: 7px;
+    padding: 6px 10px; font-size: 13px;
+    font-family: 'Noto Sans KR', sans-serif; color: var(--text-primary);
+    background: var(--bg); outline: none; resize: vertical;
+    min-height: 64px; line-height: 1.5;
+  }
+  .popup-row textarea:focus { border-color: var(--accent); }
 
   tfoot tr { background: var(--bg); border-top: 1px solid var(--border); }
   tfoot td { padding: 10px 8px; text-align: center; font-size: 12px; }
@@ -462,6 +479,10 @@
       <label>내용</label>
       <input type="text" id="popupTitle" placeholder="할일 입력" />
     </div>
+    <div class="popup-row top">
+      <label>메모</label>
+      <textarea id="popupDesc" placeholder="상세 설명 (선택)"></textarea>
+    </div>
     <div class="popup-row">
       <label>끝 시간</label>
       <select id="popupEnd"></select>
@@ -511,6 +532,7 @@ const DEFAULT_SCHEDULE = [
 
 let currentMonday = getMonday(new Date());
 let data = emptyData();
+let descs = {}; // {"r_c": "설명"} — 이벤트 시작 위치 기준
 
 function emptyData() {
   return Array.from({ length: TOTAL }, () => Array(7).fill(''));
@@ -539,37 +561,46 @@ function setLoading(on) {
 }
 
 async function saveWeek() {
-  // 2D 배열을 flat 객체로 변환 (Firebase 배열 손실 방지)
-  const flat = {};
+  const cells = {};
   for (let r = 0; r < TOTAL; r++) {
     for (let c = 0; c < 7; c++) {
       const v = (data[r] && data[r][c]) ? data[r][c] : '';
-      if (v) flat[`${r}_${c}`] = v;
+      if (v) cells[`${r}_${c}`] = v;
     }
   }
+  // 실제 셀이 있는 위치의 메모만 유지
+  const validDescs = {};
+  Object.entries(descs).forEach(([k, v]) => { if (v && cells[k]) validDescs[k] = v; });
+  const payload = Object.keys(validDescs).length ? { cells, descs: validDescs } : { cells };
   try {
-    await set(ref(db, 'schedules/' + weekKey(currentMonday)), flat);
+    await set(ref(db, 'schedules/' + weekKey(currentMonday)), payload);
   } catch(e) {
-    localStorage.setItem('wsched_' + weekKey(currentMonday), JSON.stringify(flat));
+    localStorage.setItem('wsched_' + weekKey(currentMonday), JSON.stringify(payload));
   }
 }
 
 async function loadWeek(monday) {
   const key = weekKey(monday);
-  let flat = null;
+  let raw = null;
   try {
     const snap = await get(ref(db, 'schedules/' + key));
-    if (snap.exists()) flat = snap.val();
+    if (snap.exists()) raw = snap.val();
   } catch(e) {
     const saved = localStorage.getItem('wsched_' + key);
-    if (saved) flat = JSON.parse(saved);
+    if (saved) raw = JSON.parse(saved);
   }
-  if (!flat) return applyDefault(emptyData());
+  if (!raw) { descs = {}; return applyDefault(emptyData()); }
 
-  // flat 객체 → 2D 배열 복원
+  // 하위 호환: 이전 포맷(flat 문자열) vs 신규 포맷({cells, descs})
+  const flat = raw.cells || raw;
+  descs = raw.descs || {};
+
   const d = emptyData();
   Object.entries(flat).forEach(([k, v]) => {
-    const [r, c] = k.split('_').map(Number);
+    if (typeof v !== 'string') return; // cells 키만 처리
+    const parts = k.split('_');
+    if (parts.length !== 2) return;
+    const [r, c] = parts.map(Number);
     if (r < TOTAL && c < 7) d[r][c] = v;
   });
   return d;
@@ -595,12 +626,14 @@ async function goToday() {
 async function clearDefault() {
   if (!confirm('이번 주를 수업 기본값으로 초기화할까요?')) return;
   data = applyDefault(emptyData());
+  descs = {};
   refreshAll();
   await saveWeek();
 }
 async function clearFull() {
   if (!confirm('이번 주 내용을 전부 삭제할까요?')) return;
   data = emptyData();
+  descs = {};
   refreshAll();
   await saveWeek();
 }
@@ -651,6 +684,7 @@ function openPopup(ri, ci) {
 
   const existing = (data[ri] && data[ri][ci]) ? data[ri][ci] : '';
   document.getElementById('popupTitle').value = existing;
+  document.getElementById('popupDesc').value = descs[ri + '_' + ci] || '';
 
   // 기존 내용 있으면 삭제 버튼 표시
   const delBtn = document.getElementById('popupDelete');
@@ -675,12 +709,15 @@ async function confirmPopup() {
   const title = document.getElementById('popupTitle').value.trim();
   if (!title) { closePopup(); return; }
   const endR = parseInt(document.getElementById('popupEnd').value);
+  const desc = document.getElementById('popupDesc').value.trim();
 
-  // 시작 ~ 끝 시간까지 모두 채우기
   for (let r = popupR; r < endR; r++) {
     if (!data[r]) data[r] = Array(7).fill('');
     data[r][popupC] = title;
   }
+  const key = popupR + '_' + popupC;
+  if (desc) descs[key] = desc; else delete descs[key];
+
   refreshAll();
   await saveWeek();
   closePopup();
@@ -689,14 +726,16 @@ async function confirmPopup() {
 async function deleteEvent() {
   const title = (data[popupR] && data[popupR][popupC]) ? data[popupR][popupC] : '';
   if (!title) { closePopup(); return; }
-  // 같은 내용이 연속된 셀 전부 삭제
+  // 이벤트 시작 행 탐색 (메모 키 삭제용)
   let r = popupR;
   while (r >= 0 && data[r] && data[r][popupC] === title) r--;
   r++;
+  const startR = r;
   while (r < TOTAL && data[r] && data[r][popupC] === title) {
     data[r][popupC] = '';
     r++;
   }
+  delete descs[startR + '_' + popupC];
   refreshAll();
   await saveWeek();
   closePopup();
@@ -730,7 +769,17 @@ function renderTableBody() {
         if (span > 1) td.rowSpan = span;
         const block = document.createElement('div');
         block.className = 'event-block' + (isWeekend ? ' weekend-block' : '');
-        block.textContent = val;
+        const titleEl = document.createElement('div');
+        titleEl.className = 'event-title';
+        titleEl.textContent = val;
+        block.appendChild(titleEl);
+        const desc = descs[ri + '_' + ci];
+        if (desc) {
+          const descEl = document.createElement('div');
+          descEl.className = 'event-desc';
+          descEl.textContent = desc;
+          block.appendChild(descEl);
+        }
         block.addEventListener('click', () => openPopup(ri, ci));
         td.appendChild(block);
       } else {
